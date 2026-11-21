@@ -58,9 +58,43 @@ The unit tests exercise finite episodes, checkpoint loading, terminal Bellman ta
 
 ## Limitations
 
-The agent is a simplified DQN baseline. It does not use prioritized replay, Double DQN, frame stacking, or reward normalization. The checkpoint uses the training reward over a trailing 20-episode window; it can still overestimate evaluation performance and should be checked on independent episodes. Runs on different hardware or environment versions may produce different scores.
+The agent is a simplified DQN baseline with an optional Double DQN target. It does not use prioritized replay, frame stacking, or reward normalization. The checkpoint uses the training reward over a trailing 20-episode window; it can still overestimate evaluation performance and should be checked on independent episodes. Runs on different hardware or environment versions may produce different scores.
 
-This project has **not** been independently benchmarked for a published high score. Report measured mean reward, median, standard deviation and evaluation episode count rather than an invented success rate.
+A single 100-episode benchmark was reported by the project owner (see below); it has not been independently reproduced or repeated across training seeds. Report measured mean reward, median, standard deviation and evaluation episode count rather than an invented success rate.
+
+## Measured baseline experiment (Colab, reported by project owner)
+
+One completed experiment used **300 training episodes** (seed 42) and **100 evaluation episodes** (seed 123) per policy:
+
+| Metric (episode reward) | Trained DQN | Random-action policy |
+| --- | ---: | ---: |
+| Mean | -0.27 | -7.64 |
+| Median | -0.30 | -7.50 |
+| Standard deviation | 0.69 | 0.87 |
+| Maximum | 1.50 | -4.50 |
+
+The mean difference is **+7.37 reward units per episode**. These are the numbers shared from the Colab summaries, rounded to two decimal places; original per-episode JSON/checkpoint files have not been uploaded to this repository. No success rate, pipes-passed count, or accuracy is inferred. Results reflect **one seed and one training run**, and the environment emitted Gymnasium observation-space warnings.
+
+### Stronger experiment: compare DQN and Double DQN
+
+The original DQN code remains the default. Pass `--double-dqn` for **Double DQN TD targets** (next action selected by policy, valued by target). Use different run directories so checkpoints and metrics aren't overwritten:
+
+```bash
+python agent.py --train --episodes 500 --seed 42 --runs-dir runs/dqn500
+python agent.py --eval --episodes 100 --seed 123 --runs-dir runs/dqn500
+python agent.py --random --episodes 100 --seed 123 --runs-dir runs/dqn500
+
+python agent.py --train --double-dqn --episodes 500 --seed 42 --runs-dir runs/double500
+python agent.py --eval --episodes 100 --seed 123 --runs-dir runs/double500
+```
+
+Run the comparison helper after evaluation:
+
+```bash
+python compare_runs.py --dqn runs/dqn500/FlappyBird-v0_evaluate_metrics.json --random runs/dqn500/FlappyBird-v0_random_metrics.json
+```
+
+**Caution:** If you change the algorithm, training length or reward setup, do not present the resulting score as an improvement until it has actually been measured. At least three training seeds and additional evaluation seeds would make conclusions more credible. Save `runs/` outputs before Colab disconnects.
 
 ## Portfolio description
 
