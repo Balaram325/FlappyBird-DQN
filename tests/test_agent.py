@@ -56,6 +56,32 @@ class Tests(unittest.TestCase):
             load_parameters("missing", "parameters.yaml")
 
     @patch("agent.make_environment", side_effect=lambda render=False: DummyEnv())
+    def test_random_baseline_needs_no_model(self, factory):
+        with TemporaryDirectory() as path:
+            runner = Agent(runs_dir=path)
+            result = runner.run(is_training=False, random_baseline=True,
+                                episodes=3, max_steps=3)
+            self.assertEqual(result["mode"], "random")
+            self.assertEqual(result["mean_reward"], 2.0)
+            self.assertFalse(runner.model_file.exists())
+
+    @patch("agent.make_environment", side_effect=lambda render=False: DummyEnv())
+    def test_rolling_checkpoint_training(self, factory):
+        with TemporaryDirectory() as path:
+            runner = Agent(runs_dir=path)
+            result = runner.run(is_training=True, episodes=3,
+                                max_steps=3, checkpoint_window=2)
+            self.assertEqual(result["episodes"], 3)
+            self.assertTrue(runner.model_file.exists())
+            self.assertIn("2-episode", result["checkpoint_selection"])
+
+    def test_invalid_random_training_combination(self):
+        with TemporaryDirectory() as path:
+            runner = Agent(runs_dir=path)
+            with self.assertRaises(ValueError):
+                runner.run(is_training=True, random_baseline=True)
+
+    @patch("agent.make_environment", side_effect=lambda render=False: DummyEnv())
     def test_finite_training_then_evaluation(self, factory):
         with TemporaryDirectory() as path:
             runner = Agent(runs_dir=path)
