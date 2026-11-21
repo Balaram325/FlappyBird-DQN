@@ -20,17 +20,18 @@ From the repository root:
 
 ```bash
 python agent.py --train --episodes 300 --seed 42
-python agent.py --eval --episodes 30 --seed 123
+python agent.py --eval --episodes 100 --seed 123
+python agent.py --random --episodes 100 --seed 123
 python agent.py --eval --episodes 3 --render
 ```
 
-For Windows, run these in PowerShell from the project directory. To inspect settings, edit `parameters.yaml`; the code also accepts `--config`, `--runs-dir` and `--max-steps`.
+For Windows, run these in PowerShell from the project directory. To inspect settings, edit `parameters.yaml`; the code also accepts `--config`, `--runs-dir`, `--checkpoint-window` and `--max-steps`.
 
-- `runs/FlappyBird-v0.pt` contains the best training-episode checkpoint (reward-based selection).
-- `runs/FlappyBird-v0_train_metrics.json` and `runs/FlappyBird-v0_evaluate_metrics.json` hold measured reward statistics.
+- `runs/FlappyBird-v0.pt` contains the training checkpoint chosen by the best trailing 20-episode mean reward (or final weights for runs shorter than 20 episodes).
+- `runs/FlappyBird-v0_train_metrics.json`, `runs/FlappyBird-v0_evaluate_metrics.json`, and `runs/FlappyBird-v0_random_metrics.json` hold episode reward statistics after you run the respective commands.
 - Training and evaluation stop after a **finite** number of episodes; each episode has a maximum-step safety limit.
-- Evaluation uses **epsilon = 0** and loads the saved checkpoint. Evaluation seed should differ from the training seed.
-- For credible performance comparison, run multiple evaluation seeds and compare to a random-action baseline. Don't claim a specific trained score unless you ran the experiment and saved its result.
+- Model evaluation uses **epsilon = 0** and loads a checkpoint. Random baseline takes uniformly random actions and does not need a checkpoint. Use the **same evaluation seed and number of episodes** for both, distinct from the training seed.
+- For credible performance comparison, run multiple evaluation seeds and compare to the random-action baseline. Don't claim a specific trained score unless you ran the experiment and saved its result.
 
 ## Implementation details
 
@@ -43,7 +44,9 @@ For Windows, run these in PowerShell from the project directory. To inspect sett
 | Target network | Periodic weight synchronization by optimizer update count |
 | Action selection | Decaying epsilon-greedy (training); greedy (evaluation) |
 | Episode ending | Handles `terminated`, `truncated`, and max steps |
-| Reproducibility | Python, NumPy and PyTorch random seeds |
+| Reproducibility | Python, NumPy and PyTorch random seeds, plus action-space seeding when supported |
+| Checkpoint selection | Best trailing 20-episode mean reward during training |
+| Random baseline | `--random` compares reward distribution without a checkpoint |
 
 ## Tests
 
@@ -55,10 +58,43 @@ The unit tests exercise finite episodes, checkpoint loading, terminal Bellman ta
 
 ## Limitations
 
-The agent is a simplified DQN baseline. It does not use prioritized replay, Double DQN, frame stacking, or reward normalization. The checkpoint is selected on a single highest training reward, which may overestimate generalization. Runs on different hardware or environment versions may produce different scores.
+The agent is a simplified DQN baseline. It does not use prioritized replay, Double DQN, frame stacking, or reward normalization. The checkpoint uses the training reward over a trailing 20-episode window; it can still overestimate evaluation performance and should be checked on independent episodes. Runs on different hardware or environment versions may produce different scores.
 
 This project has **not** been independently benchmarked for a published high score. Report measured mean reward, median, standard deviation and evaluation episode count rather than an invented success rate.
 
 ## Portfolio description
 
 Developed a Deep Q-Network Flappy Bird agent using PyTorch, epsilon-greedy exploration, experience replay, target-network synchronization, and reproducible training/evaluation with episode reward metrics.
+
+## Hyperparameters used for the 300-episode training setup
+
+| Parameter | Value | Purpose |
+| --- | ---: | --- |
+| Learning rate (`alpha`) | 0.001 | Adam optimizer step size |
+| Discount factor (`gamma`) | 0.99 | Future reward importance |
+| Initial / minimum epsilon | 1.0 / 0.05 | Random-action exploration range |
+| Epsilon decay per episode | 0.985 | Multiplier; epsilon reaches 0.05 around episode 199 |
+| Replay memory capacity | 100,000 | Most recent transitions retained |
+| Mini-batch size | 32 | Transitions per DQN update |
+| Target network synchronization | every 10 optimizer updates | Copies current network weights to target |
+| Hidden layer width | 256 | Single fully connected ReLU layer |
+| Default training episodes | 300 | Finite experiment horizon |
+| Maximum steps per episode | 5,000 | Hard safety cutoff |
+| Checkpoint window | 20 episodes | Best training rolling mean |
+
+The older setting `epsilon_decay=0.9995` would have left epsilon around 0.86 at 300 episodes; this version changes the **training configuration**, so results from old checkpoints are not directly comparable. The configured `reward_threshold: 1000` is retained in YAML for compatibility but is **not used as an early stopping condition**: the environment handles actual episode termination.
+
+### Record an honest benchmark
+
+After training, compare the saved policy with the random baseline using the same evaluation conditions:
+
+```bash
+python agent.py --eval --episodes 100 --seed 123
+python agent.py --random --episodes 100 --seed 123
+python agent.py --eval --episodes 100 --seed 456
+python agent.py --random --episodes 100 --seed 456
+```
+
+The JSON summaries for a given mode are overwritten on repeated runs. Save copies if you want to compare seeds. Record the **mean reward, median reward, standard deviation, and number of evaluation episodes**. These are reward metrics, **not** bird score/pipes passed, win rate, or model accuracy. To report pipes passed, add and verify a separate environment-specific score field first.
+
+Unit tests are code checks, not gameplay benchmarks; run them locally before submitting the project.
