@@ -96,6 +96,19 @@ python compare_runs.py --dqn runs/dqn500/FlappyBird-v0_evaluate_metrics.json --r
 
 **Caution:** If you change the algorithm, training length or reward setup, do not present the resulting score as an improvement until it has actually been measured. At least three training seeds and additional evaluation seeds would make conclusions more credible. Save `runs/` outputs before Colab disconnects.
 
+## Matched 500-episode experiment (reported from Google Colab)
+
+The project owner reported the following comparison after training **standard DQN and Double DQN for 500 episodes each (seed 42)**, and evaluating each trained policy over **100 episodes (seed 123)**, using the same environment and settings:
+
+| Metric (episode reward) | Standard DQN (500) | Double DQN (500) |
+| --- | ---: | ---: |
+| Mean | -0.048 | **0.777** |
+| Median | -0.300 | **0.900** |
+| Standard deviation | 0.941 | 1.050 |
+| Maximum | 2.100 | **2.200** |
+
+**Observed mean-reward difference: +0.825 reward units per episode**, favouring Double DQN in this run. This is **not** an accuracy or success percentage; no pipes-passed metrics were measured. These numbers were transcribed from the user's Colab summary, not independently reproduced, and the per-episode JSON and weights are not yet committed. The environment emitted Gymnasium observation-space warnings during experiments. Multiple independent training seeds are necessary before concluding the algorithm is consistently better.
+
 ## Portfolio description
 
 Developed a Deep Q-Network Flappy Bird agent using PyTorch, epsilon-greedy exploration, experience replay, target-network synchronization, and reproducible training/evaluation with episode reward metrics.
