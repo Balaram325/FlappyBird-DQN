@@ -4,7 +4,6 @@ Training results depend on seed, environment, hardware and hyperparameters.
 Run 'python agent.py --help' for commands. No performance claims are hardcoded.
 """
 import argparse
-import csv
 import json
 import random
 from collections import deque
@@ -27,8 +26,8 @@ def seed_everything(seed):
 def epsilon_at(episode, start, minimum, decay):
     return max(minimum, start * decay ** episode)
 
-def dqn_loss(policy, target, batch, gamma, loss_fn):
-    """Bellman target uses no next-state value after termination OR truncation."""
+def dqn_loss(policy, target, batch, gamma, loss_fn, double_dqn=False):
+    """Compute TD loss. The final batch field marks states with no bootstrap."""
     states, actions, next_states, rewards, dones = zip(*batch)
     states = torch.stack(states)
     actions = torch.tensor(actions, dtype=torch.long, device=states.device)
@@ -37,7 +36,12 @@ def dqn_loss(policy, target, batch, gamma, loss_fn):
     dones = torch.tensor(dones, dtype=torch.bool, device=states.device)
     q_values = policy(states).gather(1, actions.unsqueeze(1)).squeeze(1)
     with torch.no_grad():
-        next_values = target(next_states).max(dim=1).values
+        if double_dqn:
+            # Choose the next action with the policy network; value it with target.
+            next_actions = policy(next_states).argmax(dim=1, keepdim=True)
+            next_values = target(next_states).gather(1, next_actions).squeeze(1)
+        else:
+            next_values = target(next_states).max(dim=1).values
         targets = rewards + gamma * next_values * (~dones).float()
     return loss_fn(q_values, targets)
 
@@ -79,7 +83,7 @@ class Agent:
                                    "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
 
     def run(self, is_training=True, render=False, episodes=300, max_steps=5000,
-            random_baseline=False, checkpoint_window=20):
+            random_baseline=False, checkpoint_window=20, double_dqn=False):
         if random_baseline and is_training:
             raise ValueError("Random baseline is an evaluation mode, not training")
         if checkpoint_window < 1:
@@ -132,7 +136,7 @@ class Agent:
                                        float(reward), done))
                         if len(memory) >= self.params["mini_batch_size"]:
                             batch = random.sample(memory, self.params["mini_batch_size"])
-                            loss = dqn_loss(policy, target, batch, self.params["gamma"], loss_fn)
+                            loss = dqn_loss(policy, target, batch, self.params["gamma"], loss_fn, double_dqn=double_dqn)
                             optimizer.zero_grad(set_to_none=True)
                             loss.backward()
                             nn.utils.clip_grad_norm_(policy.parameters(), max_norm=10)
@@ -159,6 +163,7 @@ class Agent:
                 "mode": "train" if is_training else ("random" if random_baseline else "evaluate"),
                 "episodes": episodes, "seed": self.seed,
                 "max_steps": max_steps,
+                "algorithm": "Double DQN" if double_dqn else "DQN",
                 "checkpoint_selection": f"best trailing {checkpoint_window}-episode mean" if is_training and episodes >= checkpoint_window else ("final model (short run)" if is_training else "not applicable"),
                 "mean_reward": float(np.mean(rewards_history)),
                 "median_reward": float(np.median(rewards_history)),
@@ -188,6 +193,7 @@ def main(argv=None):
     parser.add_argument("--config", default="parameters.yaml")
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--render", action="store_true", help="Display game window (requires desktop)")
+    parser.add_argument("--double-dqn", action="store_true", help="Use Double DQN Bellman targets during training")
     parser.add_argument("--checkpoint-window", type=int, default=20,
                         help="Training checkpoint chosen by trailing mean reward")
     args = parser.parse_args(argv)
@@ -195,7 +201,7 @@ def main(argv=None):
     return runner.run(is_training=args.train, render=args.render,
                       episodes=args.episodes if args.episodes is not None else (300 if args.train else 30),
                       max_steps=args.max_steps, random_baseline=args.random,
-                      checkpoint_window=args.checkpoint_window)
+                      checkpoint_window=args.checkpoint_window, double_dqn=args.double_dqn)
 
 
 if __name__ == "__main__":
