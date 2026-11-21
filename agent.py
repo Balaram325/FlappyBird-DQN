@@ -78,7 +78,12 @@ class Agent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else
                                    "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
 
-    def run(self, is_training=True, render=False, episodes=300, max_steps=5000):
+    def run(self, is_training=True, render=False, episodes=300, max_steps=5000,
+            random_baseline=False, checkpoint_window=20):
+        if random_baseline and is_training:
+            raise ValueError("Random baseline is an evaluation mode, not training")
+        if checkpoint_window < 1:
+            raise ValueError("Checkpoint window must be positive")
         if episodes < 1 or max_steps < 1:
             raise ValueError("Episodes and maximum steps must be positive")
         seed_everything(self.seed)
@@ -95,22 +100,25 @@ class Agent:
                 optimizer = torch.optim.Adam(policy.parameters(), lr=self.params["alpha"])
                 memory = deque(maxlen=self.params["replay_memory_size"])
                 updates = 0
-                best_reward = float("-inf")
                 self.runs_dir.mkdir(parents=True, exist_ok=True)
-            else:
+            elif not random_baseline:
                 if not self.model_file.is_file():
                     raise FileNotFoundError(f"No checkpoint: {self.model_file}. Train first with --train.")
                 policy.load_state_dict(torch.load(self.model_file, map_location=self.device, weights_only=True))
                 policy.eval()
             loss_fn = nn.SmoothL1Loss()
+            # Use a rolling mean instead of a single unusually lucky episode.
+            best_rolling_mean = float("-inf")
             for episode in range(episodes):
                 state, _ = env.reset(seed=self.seed + episode)
+                if hasattr(env.action_space, "seed"):
+                    env.action_space.seed(self.seed + episode)
                 episode_reward = 0.0
                 epsilon = epsilon_at(episode, self.params["epsilon_init"],
                                      self.params["epsilon_min"], self.params["epsilon_decay"]) if is_training else 0.0
                 for step in range(max_steps):
                     tensor_state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-                    if is_training and random.random() < epsilon:
+                    if random_baseline or (is_training and random.random() < epsilon):
                         action = int(env.action_space.sample())
                     else:
                         with torch.no_grad():
@@ -133,18 +141,25 @@ class Agent:
                             if updates % self.params["network_sync_rate"] == 0:
                                 target.load_state_dict(policy.state_dict())
                     state = next_state
-                    if done or episode_reward >= self.params["reward_threshold"]:
+                    if done:
                         break
                 rewards_history.append(episode_reward)
-                if is_training and episode_reward > best_reward:
-                    best_reward = episode_reward
-                    torch.save(policy.state_dict(), self.model_file)
+                if is_training and len(rewards_history) >= checkpoint_window:
+                    rolling_mean = float(np.mean(rewards_history[-checkpoint_window:]))
+                    if rolling_mean > best_rolling_mean:
+                        best_rolling_mean = rolling_mean
+                        torch.save(policy.state_dict(), self.model_file)
                 if (episode + 1) % 10 == 0 or episode == 0 or episode + 1 == episodes:
                     last = rewards_history[-min(10, len(rewards_history)):]
                     print(f"Episode {episode+1}/{episodes} reward={episode_reward:.2f} mean_last_10={np.mean(last):.2f} epsilon={epsilon:.3f}")
+            # Ensure short training runs still produce a checkpoint.
+            if is_training and len(rewards_history) < checkpoint_window:
+                torch.save(policy.state_dict(), self.model_file)
             result = {
-                "mode": "train" if is_training else "evaluate",
+                "mode": "train" if is_training else ("random" if random_baseline else "evaluate"),
                 "episodes": episodes, "seed": self.seed,
+                "max_steps": max_steps,
+                "checkpoint_selection": f"best trailing {checkpoint_window}-episode mean" if is_training and episodes >= checkpoint_window else ("final model (short run)" if is_training else "not applicable"),
                 "mean_reward": float(np.mean(rewards_history)),
                 "median_reward": float(np.median(rewards_history)),
                 "std_reward": float(np.std(rewards_history)),
@@ -166,17 +181,21 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train", action="store_true")
     mode.add_argument("--eval", action="store_true", help="Evaluate saved checkpoint without exploration")
+    mode.add_argument("--random", action="store_true", help="Evaluate a random-action baseline without a checkpoint")
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--config", default="parameters.yaml")
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--render", action="store_true", help="Display game window (requires desktop)")
+    parser.add_argument("--checkpoint-window", type=int, default=20,
+                        help="Training checkpoint chosen by trailing mean reward")
     args = parser.parse_args(argv)
     runner = Agent(args.hyperparameters, args.config, args.runs_dir, args.seed)
     return runner.run(is_training=args.train, render=args.render,
                       episodes=args.episodes if args.episodes is not None else (300 if args.train else 30),
-                      max_steps=args.max_steps)
+                      max_steps=args.max_steps, random_baseline=args.random,
+                      checkpoint_window=args.checkpoint_window)
 
 
 if __name__ == "__main__":
