@@ -51,6 +51,28 @@ class Tests(unittest.TestCase):
         loss = dqn_loss(policy, target, batch, .99, nn.MSELoss())
         self.assertAlmostEqual(loss.item(), 1.0)
 
+    def test_double_dqn_uses_policy_for_action_and_target_for_value(self):
+        policy = nn.Linear(1, 2, bias=False)
+        target = nn.Linear(1, 2, bias=False)
+        with torch.no_grad():
+            policy.weight.copy_(torch.tensor([[3.0], [1.0]]))
+            target.weight.copy_(torch.tensor([[2.0], [10.0]]))
+        batch = [(torch.tensor([0.0]), 0, torch.tensor([1.0]), 0.0, False)]
+        ordinary = dqn_loss(policy, target, batch, 1.0, nn.MSELoss())
+        double = dqn_loss(policy, target, batch, 1.0, nn.MSELoss(), double_dqn=True)
+        self.assertAlmostEqual(ordinary.item(), 100.0)
+        self.assertAlmostEqual(double.item(), 4.0)
+
+    def test_double_dqn_terminal_transition_no_bootstrap(self):
+        policy = nn.Linear(1, 2, bias=False)
+        target = nn.Linear(1, 2, bias=False)
+        with torch.no_grad():
+            policy.weight.zero_()
+            target.weight.fill_(20)
+        batch = [(torch.tensor([1.]), 0, torch.tensor([2.]), 1., True)]
+        loss = dqn_loss(policy, target, batch, 0.99, nn.MSELoss(), double_dqn=True)
+        self.assertAlmostEqual(loss.item(), 1.0)
+
     def test_parameter_validation(self):
         with self.assertRaises(ValueError):
             load_parameters("missing", "parameters.yaml")
