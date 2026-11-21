@@ -1,197 +1,183 @@
-import flappy_bird_gymnasium
-import gymnasium as gym
-import torch
-from dqn import DQN
-from experience_replay import ReplayMemory
-import itertools
-import yaml
-import torch.nn as nn
-import torch.optim as optim
-import random
-import os
+"""Train and evaluate a finite Deep Q-Network for FlappyBird-v0.
+
+Training results depend on seed, environment, hardware and hyperparameters.
+Run 'python agent.py --help' for commands. No performance claims are hardcoded.
+"""
 import argparse
+import csv
+import json
+import random
+from collections import deque
+from pathlib import Path
 
+import numpy as np
+import torch
+import torch.nn as nn
+import yaml
 
+from dqn import DQN
 
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
+def epsilon_at(episode, start, minimum, decay):
+    return max(minimum, start * decay ** episode)
 
+def dqn_loss(policy, target, batch, gamma, loss_fn):
+    """Bellman target uses no next-state value after termination OR truncation."""
+    states, actions, next_states, rewards, dones = zip(*batch)
+    states = torch.stack(states)
+    actions = torch.tensor(actions, dtype=torch.long, device=states.device)
+    next_states = torch.stack(next_states)
+    rewards = torch.tensor(rewards, dtype=torch.float32, device=states.device)
+    dones = torch.tensor(dones, dtype=torch.bool, device=states.device)
+    q_values = policy(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+    with torch.no_grad():
+        next_values = target(next_states).max(dim=1).values
+        targets = rewards + gamma * next_values * (~dones).float()
+    return loss_fn(q_values, targets)
 
-if torch.backends.mps.is_available():
-    device = "mps"
+def make_environment(render=False):
+    # Lazy imports so unit tests can run without pygame or the game installed.
+    import gymnasium as gym
+    import flappy_bird_gymnasium  # noqa: F401 - registers FlappyBird-v0
+    return gym.make("FlappyBird-v0", render_mode="human" if render else None)
 
-elif torch.cuda.is_available():
-    device = "cuda"
-
-else:
-    device = "cpu"
-
-RUNS_DIR = "runs"
-os.makedirs(RUNS_DIR, exist_ok = True)
+def load_parameters(name, config_path):
+    with open(config_path, encoding="utf-8") as handle:
+        configs = yaml.safe_load(handle) or {}
+    if name not in configs:
+        raise ValueError(f"Unknown parameter set '{name}'. Available: {list(configs)}")
+    params = configs[name]
+    required = {"alpha", "gamma", "epsilon_init", "epsilon_min", "epsilon_decay",
+                "replay_memory_size", "mini_batch_size", "network_sync_rate", "reward_threshold"}
+    missing = required - set(params)
+    if missing:
+        raise ValueError(f"Missing parameters: {sorted(missing)}")
+    if params["mini_batch_size"] < 1 or params["replay_memory_size"] < params["mini_batch_size"]:
+        raise ValueError("Replay capacity must be at least the positive mini-batch size")
+    if params["network_sync_rate"] < 1 or params["alpha"] <= 0:
+        raise ValueError("Network sync rate and learning rate must be positive")
+    if not 0 <= params["epsilon_min"] <= params["epsilon_init"] <= 1 or not 0 < params["epsilon_decay"] <= 1:
+        raise ValueError("Invalid epsilon parameters")
+    if not 0 <= params["gamma"] <= 1:
+        raise ValueError("Gamma must be between 0 and 1")
+    return params
 
 class Agent:
-    def __init__(self, param_set):
+    def __init__(self, param_set="FlappyBird-v0", config_path="parameters.yaml", runs_dir="runs", seed=42):
         self.param_set = param_set
-        with open("parameters.yaml", "r") as f:
-           all_param_set = yaml.safe_load(f)
-           params = all_param_set[param_set]
-        
-        self.alpha = params["alpha"]
-        self.gamma = params["gamma"]
+        self.params = load_parameters(param_set, config_path)
+        self.seed = seed
+        self.runs_dir = Path(runs_dir)
+        self.model_file = self.runs_dir / f"{param_set}.pt"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else
+                                   "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
 
-        self.epsilon_init = params["epsilon_init"]
-        self.epsilon_min = params["epsilon_min"]
-        self.epsilon_decay = params["epsilon_decay"]
-
-        self.replay_memory_size = params["replay_memory_size"]
-        self.mini_batch_size = params["mini_batch_size"]
-
-        self.reward_threshold = params["reward_threshold"]
-        self.network_sync_rate = params["network_sync_rate"]
-
-        self.loss_fn = nn.MSELoss()
-        self.optimizer = None
-
-        self.LOG_FILE = os.path.join(RUNS_DIR, f"{self.param_set}.log")
-        self.MODEL_FILE = os.path.join(RUNS_DIR, f"{self.param_set}.pt")
-
-
-    def run(self, is_training=True, render= False):
-    
-
-        # env = gym.make("FlappyBird-v0", render_mode="human" if render else None)
-        env = gym.make("FlappyBird-v0")
-
-
-        num_states = env.observation_space.shape[0]  ## input dim
-        num_actions = env.action_space.n  ## output dim
-
-        policy_dqn = DQN(num_states, num_actions).to(device)
-
-        
-
-        if is_training:
-            memory = ReplayMemory(self.replay_memory_size)
-            epsilon = self.epsilon_init
-
-            target_dqn = DQN(num_states, num_actions).to(device)
-            ## copy the wt  & bias values from policy => target
-            target_dqn.load_state_dict(policy_dqn.state_dict())
-
-            steps = 0
-
-            self.optimizer = optim.Adam(policy_dqn.parameters(), lr = self.alpha)
-
-            best_reward = float("-inf")
-
-        else:
-            ## best policy load
-            policy_dqn.load_state_dict(torch.load(self.MODEL_FILE))
-            policy_dqn.eval()    
-
-
-
-        for episode in itertools.count():
-            state, _ = env.reset()
-
-            state = torch.tensor(state, dtype = torch.float, device = device)
-
-            episode_reward = 0
-            terminated = False
-
-
-            while not terminated and episode_reward < self.reward_threshold:
-                if is_training and random.random() < epsilon:
-                    action = env.action_space.sample() # explore
-                    action = torch.tensor(action, dtype = torch.long, device = device)
-
-                
-                else:
-                    with torch.no_grad():
-                        action = policy_dqn(state.unsqueeze(dim=0)).argmax()  # exploit
-
-
-                
-
-                # Processing:
-                next_state, reward, terminated, _, _ = env.step(action.item())
-                
-                episode_reward += reward
-                # create tensors
-                reward = torch.tensor(reward, dtype = torch.float, device = device)
-                next_state = torch.tensor(next_state, dtype = torch.float, device = device)
-
-                if is_training:
-                    memory.append((state, action, next_state, reward, terminated))
-                    steps += 1
-                state = next_state
-                
-            
-            print(f"episode ={episode+1} with total reward = {episode_reward} & epsilon = {epsilon}")
+    def run(self, is_training=True, render=False, episodes=300, max_steps=5000):
+        if episodes < 1 or max_steps < 1:
+            raise ValueError("Episodes and maximum steps must be positive")
+        seed_everything(self.seed)
+        env = make_environment(render=render)
+        rewards_history = []
+        try:
+            state_dim = env.observation_space.shape[0]
+            action_dim = env.action_space.n
+            policy = DQN(state_dim, action_dim).to(self.device)
             if is_training:
-                ## epsilon decay
-                epsilon = max(epsilon* self.epsilon_decay, self.epsilon_min)
-
-                if episode_reward > best_reward:
-                    log_msg = f"best reward = {episode_reward} for episode={episode+1}"
-
-                    with open(self.LOG_FILE, "a") as f:
-                        f.write(log_msg + "\n")
-
-                    torch.save(policy_dqn.state_dict(), self.MODEL_FILE)
+                target = DQN(state_dim, action_dim).to(self.device)
+                target.load_state_dict(policy.state_dict())
+                target.eval()
+                optimizer = torch.optim.Adam(policy.parameters(), lr=self.params["alpha"])
+                memory = deque(maxlen=self.params["replay_memory_size"])
+                updates = 0
+                best_reward = float("-inf")
+                self.runs_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                if not self.model_file.is_file():
+                    raise FileNotFoundError(f"No checkpoint: {self.model_file}. Train first with --train.")
+                policy.load_state_dict(torch.load(self.model_file, map_location=self.device, weights_only=True))
+                policy.eval()
+            loss_fn = nn.SmoothL1Loss()
+            for episode in range(episodes):
+                state, _ = env.reset(seed=self.seed + episode)
+                episode_reward = 0.0
+                epsilon = epsilon_at(episode, self.params["epsilon_init"],
+                                     self.params["epsilon_min"], self.params["epsilon_decay"]) if is_training else 0.0
+                for step in range(max_steps):
+                    tensor_state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+                    if is_training and random.random() < epsilon:
+                        action = int(env.action_space.sample())
+                    else:
+                        with torch.no_grad():
+                            action = int(policy(tensor_state.unsqueeze(0)).argmax(dim=1).item())
+                    next_state, reward, terminated, truncated, _ = env.step(action)
+                    episode_reward += float(reward)
+                    done = bool(terminated or truncated or step + 1 == max_steps)
+                    if is_training:
+                        memory.append((tensor_state, action,
+                                       torch.as_tensor(next_state, dtype=torch.float32, device=self.device),
+                                       float(reward), done))
+                        if len(memory) >= self.params["mini_batch_size"]:
+                            batch = random.sample(memory, self.params["mini_batch_size"])
+                            loss = dqn_loss(policy, target, batch, self.params["gamma"], loss_fn)
+                            optimizer.zero_grad(set_to_none=True)
+                            loss.backward()
+                            nn.utils.clip_grad_norm_(policy.parameters(), max_norm=10)
+                            optimizer.step()
+                            updates += 1
+                            if updates % self.params["network_sync_rate"] == 0:
+                                target.load_state_dict(policy.state_dict())
+                    state = next_state
+                    if done or episode_reward >= self.params["reward_threshold"]:
+                        break
+                rewards_history.append(episode_reward)
+                if is_training and episode_reward > best_reward:
                     best_reward = episode_reward
-
-            if is_training and len(memory) > self.mini_batch_size:
-                # get sample
-                mini_batch = memory.sample(self.mini_batch_size)
-
-                self.optimize(mini_batch, policy_dqn, target_dqn)
-                
-
-                #sync the network
-                if steps > self.network_sync_rate:
-                    target_dqn.load_state_dict(policy_dqn.state_dict())
-                    steps = 0
-        # env.close()
-        reward
-    
-
-    def optimize(self, mini_batch, policy_dqn, target_dqn):
-        # get batch of experiences
-        states, actions, next_states, rewards, terminations = zip(*mini_batch)
-
-        states = torch.stack(states)
-        actions = torch.stack(actions)
-        next_states = torch.stack(next_states)
-        rewards = torch.stack(rewards)
-        terminations = torch.tensor(terminations).float().to(device)
+                    torch.save(policy.state_dict(), self.model_file)
+                if (episode + 1) % 10 == 0 or episode == 0 or episode + 1 == episodes:
+                    last = rewards_history[-min(10, len(rewards_history)):]
+                    print(f"Episode {episode+1}/{episodes} reward={episode_reward:.2f} mean_last_10={np.mean(last):.2f} epsilon={epsilon:.3f}")
+            result = {
+                "mode": "train" if is_training else "evaluate",
+                "episodes": episodes, "seed": self.seed,
+                "mean_reward": float(np.mean(rewards_history)),
+                "median_reward": float(np.median(rewards_history)),
+                "std_reward": float(np.std(rewards_history)),
+                "max_reward": float(max(rewards_history)),
+                "rewards": rewards_history,
+            }
+            self.runs_dir.mkdir(parents=True, exist_ok=True)
+            output = self.runs_dir / f"{self.param_set}_{result['mode']}_metrics.json"
+            output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(f"Metrics saved to {output}")
+            return result
+        finally:
+            env.close()
 
 
-        #calculate target Q-values - if terminations = true => zero
-        with torch.no_grad():
-            target_q = rewards + (1-terminations) * self.gamma * target_dqn(next_states).max(dim = 1)[0]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Flappy Bird DQN train/evaluate")
+    parser.add_argument("hyperparameters", nargs="?", default="FlappyBird-v0")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--train", action="store_true")
+    mode.add_argument("--eval", action="store_true", help="Evaluate saved checkpoint without exploration")
+    parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=5000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--config", default="parameters.yaml")
+    parser.add_argument("--runs-dir", default="runs")
+    parser.add_argument("--render", action="store_true", help="Display game window (requires desktop)")
+    args = parser.parse_args(argv)
+    runner = Agent(args.hyperparameters, args.config, args.runs_dir, args.seed)
+    return runner.run(is_training=args.train, render=args.render,
+                      episodes=args.episodes if args.episodes is not None else (300 if args.train else 30),
+                      max_steps=args.max_steps)
 
-        ## calculate y_pred i.e. Q-value from current policy
-        current_q = policy_dqn(states).gather(dim=1, index = actions.unsqueeze(dim=1)).squeeze()
-
-        #compute loss
-        loss = self.loss_fn(current_q, target_q)
-
-        # optimize model
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
 
 if __name__ == "__main__":
-    #Parse command line inputs
-    parser = argparse.ArgumentParser(description = 'Train or test model.')
-    parser.add_argument('hyperparameters', help ='')
-    parser.add_argument('--train', help='Training node', action='store_true')
-    args = parser.parse_args()
-
-    dql = Agent(param_set=args.hyperparameters)
-
-    if args.train:
-        dql.run(is_training=True)
-
-    else:
-        dql.run(is_training=False, render=True)
+    main()
